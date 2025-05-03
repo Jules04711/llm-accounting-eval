@@ -8,34 +8,60 @@ import pandas as pd
 
 st.set_page_config(page_title="Accounting Knowledge Quiz", page_icon="💼", layout="wide")
 
-# Accounting questions
-accounting_questions = [
-    {
-        "difficulty": "Easy",
-        "question": "What is the accounting equation and explain its components?",
-        "answer": "The accounting equation is Assets = Liabilities + Equity. Assets are resources owned by a business. Liabilities are obligations or debts owed to others. Equity represents the owner's interest in the business."
-    },
-    {
-        "difficulty": "Easy",
-        "question": "Explain the difference between accrual accounting and cash accounting.",
-        "answer": "Accrual accounting records revenues when earned and expenses when incurred, regardless of when cash changes hands. Cash accounting records transactions only when cash is received or paid. Accrual accounting provides a more accurate picture of financial position but is more complex."
-    },
-    {
-        "difficulty": "Intermediate",
-        "question": "Explain the concept of depreciation and the different methods of calculating it.",
-        "answer": "Depreciation is the systematic allocation of an asset's cost over its useful life. Methods include: Straight-line (equal amounts each period), Declining balance (accelerated depreciation with higher amounts in earlier years), Units of production (based on actual usage), and Sum-of-the-years'-digits (accelerated method based on remaining useful life)."
-    },
-    {
-        "difficulty": "Intermediate",
-        "question": "What is the purpose of a bank reconciliation statement and how is it prepared?",
-        "answer": "A bank reconciliation statement reconciles a company's bank account balance with its accounting records. It identifies discrepancies by accounting for outstanding checks, deposits in transit, bank fees, errors, and other items. Preparation involves comparing the bank statement with the company's ledger and adjusting for timing differences and errors."
-    },
-    {
-        "difficulty": "Advanced",
-        "question": "Explain the concept of deferred tax assets and liabilities in accordance with accounting standards.",
-        "answer": "Deferred tax assets and liabilities arise from temporary differences between accounting income and taxable income. Deferred tax assets represent future tax benefits (from deductible temporary differences) while deferred tax liabilities represent future tax obligations (from taxable temporary differences). They're recognized when there's a difference between the tax basis of assets/liabilities and their carrying amounts in financial statements."
-    }
-]
+# Function to generate accounting questions using LLM
+def generate_accounting_questions(evaluator_model):
+    prompt = """
+    Generate 3 accounting questions with corresponding detailed answers.
+    Questions should be of different difficulty levels:
+    1. Easy: Basic accounting concepts
+    2. Medium: Intermediate accounting principles 
+    3. Hard: Advanced accounting concepts or regulations
+    
+    Format the output as a JSON array with each question having these fields:
+    - difficulty: "Easy", "Medium", or "Hard"
+    - question: The accounting question
+    - answer: A detailed, comprehensive answer
+    
+    Return only the JSON array, nothing else.
+    """
+    
+    try:
+        response = query_ollama(evaluator_model, prompt)
+        
+        # Try to extract JSON from the response
+        json_start = response.find('[')
+        json_end = response.rfind(']') + 1
+        
+        if json_start >= 0 and json_end > json_start:
+            json_str = response[json_start:json_end]
+            questions = json.loads(json_str)
+            return questions
+        else:
+            # Fallback questions if JSON parsing fails
+            return fallback_questions()
+    except Exception as e:
+        st.error(f"Error generating questions: {e}")
+        return fallback_questions()
+
+# Fallback questions if LLM generation fails
+def fallback_questions():
+    return [
+        {
+            "difficulty": "Easy",
+            "question": "What is the accounting equation and explain its components?",
+            "answer": "The accounting equation is Assets = Liabilities + Equity. Assets are resources owned by a business. Liabilities are obligations or debts owed to others. Equity represents the owner's interest in the business."
+        },
+        {
+            "difficulty": "Medium",
+            "question": "Explain the concept of depreciation and the different methods of calculating it.",
+            "answer": "Depreciation is the systematic allocation of an asset's cost over its useful life. Methods include: Straight-line (equal amounts each period), Declining balance (accelerated depreciation with higher amounts in earlier years), Units of production (based on actual usage), and Sum-of-the-years'-digits (accelerated method based on remaining useful life)."
+        },
+        {
+            "difficulty": "Hard",
+            "question": "Explain the concept of deferred tax assets and liabilities in accordance with accounting standards.",
+            "answer": "Deferred tax assets and liabilities arise from temporary differences between accounting income and taxable income. Deferred tax assets represent future tax benefits (from deductible temporary differences) while deferred tax liabilities represent future tax obligations (from taxable temporary differences). They're recognized when there's a difference between the tax basis of assets/liabilities and their carrying amounts in financial statements."
+        }
+    ]
 
 # Database functions
 def init_db():
@@ -81,13 +107,6 @@ def init_db():
     )
     ''')
     
-    # Insert questions if needed
-    for q in accounting_questions:
-        c.execute("SELECT * FROM questions WHERE question_text = ?", (q["question"],))
-        if not c.fetchone():
-            c.execute("INSERT INTO questions (difficulty, question_text, correct_answer) VALUES (?, ?, ?)",
-                     (q["difficulty"], q["question"], q["answer"]))
-    
     conn.commit()
     conn.close()
 
@@ -106,9 +125,25 @@ def save_response(quiz_id, question_text, model_name, response_text, evaluation,
         conn = sqlite3.connect('db/quiz_results.db')
         c = conn.cursor()
         
-        # Get question ID
+        # Get question ID or insert if not exists
         c.execute("SELECT question_id FROM questions WHERE question_text = ?", (question_text,))
-        question_id = c.fetchone()[0]
+        result = c.fetchone()
+        
+        if result:
+            question_id = result[0]
+        else:
+            # This is a new question generated by LLM, insert it
+            for question in st.session_state.accounting_questions:
+                if question["question"] == question_text:
+                    c.execute("INSERT INTO questions (difficulty, question_text, correct_answer) VALUES (?, ?, ?)",
+                            (question["difficulty"], question_text, question["answer"]))
+                    question_id = c.lastrowid
+                    break
+            else:
+                # Fallback if not found
+                c.execute("INSERT INTO questions (difficulty, question_text, correct_answer) VALUES (?, ?, ?)",
+                        ("Unknown", question_text, ""))
+                question_id = c.lastrowid
         
         # Save response
         c.execute('''
@@ -215,8 +250,6 @@ def evaluate_response(question, correct_answer, model_response, evaluator_model)
         }
 
 # Initialize session state
-if 'current_question' not in st.session_state:
-    st.session_state.current_question = 0
 if 'scores' not in st.session_state:
     st.session_state.scores = {}
 if 'responses' not in st.session_state:
@@ -229,6 +262,8 @@ if 'processing' not in st.session_state:
     st.session_state.processing = False
 if 'quiz_id' not in st.session_state:
     st.session_state.quiz_id = None
+if 'accounting_questions' not in st.session_state:
+    st.session_state.accounting_questions = []
 
 # Initialize database
 init_db()
@@ -266,12 +301,16 @@ with st.sidebar:
     if st.button("Start Quiz"):
         st.session_state.models_to_test = [model for model, selected in model_selections.items() if selected]
         st.session_state.evaluator_model = evaluator_model
-        st.session_state.current_question = 0
         st.session_state.scores = {model: 0 for model in st.session_state.models_to_test}
         st.session_state.responses = {}
         st.session_state.quiz_complete = False
-        st.session_state.processing = False
+        st.session_state.processing = True
         st.session_state.quiz_id = create_new_quiz(evaluator_model)
+        
+        # Generate questions with the evaluator model
+        with st.spinner("Generating accounting questions..."):
+            st.session_state.accounting_questions = generate_accounting_questions(evaluator_model)
+        
         st.rerun()
     
     # Database stats
@@ -292,47 +331,32 @@ with st.sidebar:
 
 # Main content
 if len(st.session_state.models_to_test) > 0:
-    # Progress bar
-    total_questions = len(accounting_questions)
-    current_question = st.session_state.current_question + 1
-    progress_percentage = current_question / total_questions
-    
-    st.markdown(f"### Progress: Question {current_question}/{total_questions}")
-    st.progress(progress_percentage)
-    
-    # Display current question
-    if not st.session_state.quiz_complete:
-        current_q = accounting_questions[st.session_state.current_question]
-        st.subheader(f"Question {st.session_state.current_question + 1}: {current_q['difficulty']}")
-        st.markdown(f"**{current_q['question']}**")
-        
-        # Process responses for current question automatically
-        has_responses = (st.session_state.current_question in st.session_state.responses and 
-                        len(st.session_state.responses[st.session_state.current_question]) == len(st.session_state.models_to_test))
-        
-        if not has_responses and not st.session_state.processing:
-            st.session_state.processing = True
-            
-            with st.spinner("Getting responses from models..."):
-                # Get responses from all models
+    # Process all quiz questions at once in the background
+    if st.session_state.processing and not st.session_state.quiz_complete:
+        with st.spinner("Processing all questions... This may take a minute..."):
+            # Get responses from all models for all questions
+            for q_idx, current_q in enumerate(st.session_state.accounting_questions):
+                if q_idx not in st.session_state.responses:
+                    st.session_state.responses[q_idx] = {}
+                
                 for model in st.session_state.models_to_test:
                     response = query_ollama(model, current_q['question'], 
                                           "You are an expert accountant. Provide a detailed and accurate answer to the accounting question.")
                     
-                    if st.session_state.current_question not in st.session_state.responses:
-                        st.session_state.responses[st.session_state.current_question] = {}
-                    
-                    st.session_state.responses[st.session_state.current_question][model] = {
+                    st.session_state.responses[q_idx][model] = {
                         "response": response,
                         "evaluation": None
                     }
-            
-            with st.spinner("Evaluating responses..."):
-                # Evaluate responses
-                for model in st.session_state.models_to_test:
-                    model_response = st.session_state.responses[st.session_state.current_question][model]["response"]
                     
-                    if model_response.startswith("Error:"):
+                    # Evaluate the response
+                    if not response.startswith("Error:"):
+                        evaluation = evaluate_response(
+                            current_q['question'],
+                            current_q['answer'],
+                            response,
+                            st.session_state.evaluator_model
+                        )
+                    else:
                         evaluation = {
                             "accuracy": 0,
                             "completeness": 0,
@@ -340,15 +364,8 @@ if len(st.session_state.models_to_test) > 0:
                             "total_score": 0,
                             "feedback": "Response contained an error and could not be evaluated."
                         }
-                    else:
-                        evaluation = evaluate_response(
-                            current_q['question'],
-                            current_q['answer'],
-                            model_response,
-                            st.session_state.evaluator_model
-                        )
                     
-                    st.session_state.responses[st.session_state.current_question][model]["evaluation"] = evaluation
+                    st.session_state.responses[q_idx][model]["evaluation"] = evaluation
                     st.session_state.scores[model] += evaluation.get("total_score", 0)
                     
                     # Save to database
@@ -356,149 +373,59 @@ if len(st.session_state.models_to_test) > 0:
                         st.session_state.quiz_id,
                         current_q['question'],
                         model,
-                        model_response,
+                        response,
                         evaluation,
                         st.session_state.evaluator_model
                     )
             
             st.session_state.processing = False
+            st.session_state.quiz_complete = True
             st.rerun()
-        
-        # Display current question responses
-        if has_responses:
-            st.markdown("### Current Question Results")
-            for model in st.session_state.models_to_test:
-                response = st.session_state.responses[st.session_state.current_question][model]["response"]
-                if response.startswith("Error:"):
-                    continue
-                    
-                with st.expander(f"Response from {model}", expanded=True):
-                    st.markdown(response)
-                    
-                    eval_data = st.session_state.responses[st.session_state.current_question][model]["evaluation"]
-                    if eval_data:
-                        col1, col2, col3, col4 = st.columns(4)
-                        col1.metric("Accuracy", eval_data.get("accuracy", "N/A"))
-                        col2.metric("Completeness", eval_data.get("completeness", "N/A"))
-                        col3.metric("Clarity", eval_data.get("clarity", "N/A"))
-                        col4.metric("Total", eval_data.get("total_score", "N/A"))
-                        st.markdown(f"<small>**Feedback:** {eval_data.get('feedback', 'No feedback')}</small>", unsafe_allow_html=True)
-
-            # Navigation buttons
-            col1, col2 = st.columns(2)
-            if st.session_state.current_question > 0:
-                if col1.button("Previous Question"):
-                    st.session_state.current_question -= 1
-                    st.rerun()
-                    
-            if st.session_state.current_question < len(accounting_questions) - 1:
-                if col2.button("Next Question"):
-                    st.session_state.current_question += 1
-                    st.rerun()
-            else:
-                if col2.button("Complete Quiz"):
-                    st.session_state.quiz_complete = True
-                    st.rerun()
-        
-        # Display previous questions results
-        if st.session_state.current_question > 0:
-            st.markdown("### Previous Questions Results")
-            for q_idx in range(st.session_state.current_question):
-                with st.expander(f"Question {q_idx + 1}: {accounting_questions[q_idx]['question']}"):
-                    for model in st.session_state.models_to_test:
-                        if q_idx in st.session_state.responses and model in st.session_state.responses[q_idx]:
-                            response = st.session_state.responses[q_idx][model]["response"]
-                            if response.startswith("Error:"):
-                                continue
-                                
-                            st.markdown(f"**{model}**")
-                            st.markdown(response)
-                            
-                            eval_data = st.session_state.responses[q_idx][model]["evaluation"]
-                            if eval_data:
-                                col1, col2, col3, col4 = st.columns(4)
-                                col1.metric("Accuracy", eval_data.get("accuracy", "N/A"))
-                                col2.metric("Completeness", eval_data.get("completeness", "N/A"))
-                                col3.metric("Clarity", eval_data.get("clarity", "N/A"))
-                                col4.metric("Total", eval_data.get("total_score", "N/A"))
-                                st.markdown(f"<small>**Feedback:** {eval_data.get('feedback', 'No feedback')}</small>", unsafe_allow_html=True)
-                            st.divider()
+    
+    # Show progress while processing
+    if st.session_state.processing:
+        st.info("Quiz is running... Please wait while we process all questions.")
+        st.progress(0.5)  # Show indeterminate progress
     
     # Display final results
-    if st.session_state.quiz_complete:
-        st.header("🏆 Quiz Complete - Final Results")
+    elif st.session_state.quiz_complete:
+        st.header("Quiz Results")
         
         # Create a sorted list of models by score
         sorted_models = sorted(st.session_state.scores.items(), key=lambda x: x[1], reverse=True)
         
-        # Display winner
-        st.subheader(f"🥇 Winner: {sorted_models[0][0]} with {sorted_models[0][1]} points")
-        
         # Display all scores
         st.markdown("### Final Scores")
-        scores_df = pd.DataFrame({
-            'Model': [model for model, _ in sorted_models],
-            'Total Score': [score for _, score in sorted_models]
-        })
-        st.bar_chart(scores_df.set_index('Model'))
         
-        # Create detailed summary table
-        st.markdown("### Detailed Score Breakdown")
+        # Create modern card design for scores
+        cols = st.columns(min(3, len(sorted_models)))  # Max 3 cards per row
         
-        # Prepare data for the summary table
-        summary_data = []
+        for i, (model, score) in enumerate(sorted_models):
+            col_index = i % len(cols)
+            with cols[col_index]:
+                # Create a modern card design
+                card = st.container(border=True)
+                with card:
+                    # Model name with larger font
+                    st.markdown(f"<h3 style='text-align: center; margin-bottom: 0px;'>{model}</h3>", unsafe_allow_html=True)
+                    
+                    # Score with even larger font and center-aligned
+                    st.markdown(f"<h1 style='text-align: center; margin: 10px 0; color: {'#1f77b4' if i == 0 else '#7fafdf'};'>{score}</h1>", 
+                              unsafe_allow_html=True)
+                    
+                    # Add a trophy for the winner
+                    if i == 0:
+                        st.markdown("<div style='text-align: center; margin-top: 5px;'>🏆 Winner</div>", unsafe_allow_html=True)
         
-        for q_idx, question in enumerate(accounting_questions):
-            for model in st.session_state.models_to_test:
-                if q_idx in st.session_state.responses and model in st.session_state.responses[q_idx]:
-                    response = st.session_state.responses[q_idx][model]["response"]
-                    if response.startswith("Error:"):
-                        continue
-                        
-                    eval_data = st.session_state.responses[q_idx][model]["evaluation"]
-                    if eval_data:
-                        summary_data.append({
-                            'Question': f"Q{q_idx+1}: {question['question'][:50]}...",
-                            'Model': model,
-                            'Accuracy': eval_data.get("accuracy", 0),
-                            'Completeness': eval_data.get("completeness", 0),
-                            'Clarity': eval_data.get("clarity", 0),
-                            'Total': eval_data.get("total_score", 0)
-                        })
+        # Display questions and responses
+        st.markdown("### Quiz Questions and Responses")
         
-        summary_df = pd.DataFrame(summary_data)
-        if not summary_df.empty:
-            st.dataframe(summary_df, use_container_width=True)
-            
-            # Create pivot table for better visualization
-            pivot_df = summary_df.pivot_table(
-                index='Question', 
-                columns='Model', 
-                values='Total',
-                aggfunc='sum'
-            )
-            # Reset index to make the dataframe compatible with st.bar_chart
-            pivot_df = pivot_df.reset_index()
-            # Use a regular index instead of the Question text
-            pivot_df.index = range(len(pivot_df))
-            
-            st.markdown("### Score Comparison by Question")
-            # Create a mapping of index to question for the axis
-            questions = pivot_df['Question'].tolist()
-            # Drop the Question column as it's now in the index
-            chart_df = pivot_df.drop(columns=['Question'])
-            st.bar_chart(chart_df)
-        
-        # Comprehensive Response Summary
-        st.markdown("### All Responses and Evaluations")
-        
-        tabs = st.tabs([f"Question {i+1}" for i in range(len(accounting_questions))])
+        tabs = st.tabs([f"{q['difficulty']} Question" for q in st.session_state.accounting_questions])
         
         for q_idx, tab in enumerate(tabs):
             with tab:
-                question = accounting_questions[q_idx]
-                st.markdown(f"**{question['question']}**")
-                st.markdown(f"*Difficulty: {question['difficulty']}*")
+                question = st.session_state.accounting_questions[q_idx]
+                st.markdown(f"**Question:** {question['question']}")
                 st.markdown("**Correct Answer Concepts:**")
                 st.markdown(f"{question['answer']}")
                 st.markdown("---")
@@ -531,15 +458,62 @@ if len(st.session_state.models_to_test) > 0:
                                     st.markdown("**Feedback:**")
                                     st.markdown(f"{eval_data.get('feedback', 'No feedback')}")
         
+        # Detailed score breakdown
+        st.markdown("### Detailed Score Breakdown")
+        
+        # Prepare data for the summary table
+        summary_data = []
+        
+        for q_idx, question in enumerate(st.session_state.accounting_questions):
+            for model in st.session_state.models_to_test:
+                if q_idx in st.session_state.responses and model in st.session_state.responses[q_idx]:
+                    response = st.session_state.responses[q_idx][model]["response"]
+                    if response.startswith("Error:"):
+                        continue
+                        
+                    eval_data = st.session_state.responses[q_idx][model]["evaluation"]
+                    if eval_data:
+                        summary_data.append({
+                            'Question': f"{question['difficulty']}: {question['question']}",
+                            'Model': model,
+                            'Accuracy': eval_data.get("accuracy", 0),
+                            'Completeness': eval_data.get("completeness", 0),
+                            'Clarity': eval_data.get("clarity", 0),
+                            'Total': eval_data.get("total_score", 0)
+                        })
+        
+        summary_df = pd.DataFrame(summary_data)
+        if not summary_df.empty:
+            # Hide index column and show full question
+            st.dataframe(
+                summary_df,
+                use_container_width=True,
+                hide_index=True
+            )
+            
+            # Create pivot table for better visualization
+            pivot_df = summary_df.pivot_table(
+                index='Question', 
+                columns='Model', 
+                values='Total',
+                aggfunc='sum'
+            )
+            # Reset index to make the dataframe compatible with st.bar_chart
+            pivot_df = pivot_df.reset_index()
+            # Use a regular index instead of the Question text
+            pivot_df.index = range(len(pivot_df))
+        
         # Reset button
         if st.button("Start New Quiz"):
-            st.session_state.current_question = 0
             st.session_state.scores = {}
             st.session_state.responses = {}
             st.session_state.quiz_complete = False
             st.session_state.models_to_test = []
             st.session_state.processing = False
             st.session_state.quiz_id = None
+            st.session_state.accounting_questions = []
             st.rerun()
+    else:
+        st.info("Starting quiz... Please wait.")
 else:
     st.info("👈 Please select models to test in the sidebar and click 'Start Quiz'")
