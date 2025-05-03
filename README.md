@@ -1,4 +1,4 @@
-# LLM Accounting Quiz
+# LLM Accounting Evaluation
 
 A Streamlit application that tests different LLM models on accounting knowledge questions. The app evaluates responses based on accuracy, completeness, and clarity.
 
