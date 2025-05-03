@@ -5,40 +5,189 @@ import sqlite3
 import os
 from datetime import datetime
 import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-st.set_page_config(page_title="Accounting Knowledge Quiz", page_icon="💼", layout="wide")
+
+st.set_page_config(page_title="LLM Benchmarking for Accounting", page_icon="💼", layout="wide")
+
+# Function to analyze model performance using ML techniques
+def analyze_model_performance(conn):
+    """
+    Analyze model performance using machine learning techniques
+    """
+    # Get comprehensive quiz data
+    query = """
+    SELECT 
+        r.model_name,
+        r.accuracy, 
+        r.completeness, 
+        r.clarity, 
+        r.total_score,
+        ques.difficulty
+    FROM responses r
+    JOIN questions ques ON r.question_id = ques.question_id
+    WHERE r.accuracy IS NOT NULL
+    AND NOT r.response_text LIKE 'Error:%'
+    """
+    
+    try:
+        df = pd.read_sql_query(query, conn)
+        
+        if len(df) < 10:
+            return None, "Not enough data for meaningful analysis. Need at least 10 responses."
+            
+        # Prepare the data
+        # Encode difficulty levels
+        df['difficulty_encoded'] = df['difficulty'].map({'Easy': 1, 'Medium': 2, 'Hard': 3})
+        
+        # Feature set for analysis
+        features = ['accuracy', 'completeness', 'clarity', 'difficulty_encoded']
+        
+        # Get unique models
+        models = df['model_name'].unique()
+        
+        results = {
+            'overall_best': None,
+            'difficulty_analysis': {},
+            'feature_importance': {},
+            'clustering': None,
+            'pca_data': None,
+            'pca_models': None
+        }
+        
+        # 1. Overall best model by average score
+        avg_scores = df.groupby('model_name')['total_score'].mean().sort_values(ascending=False)
+        results['overall_best'] = avg_scores.index[0]
+        results['avg_scores'] = avg_scores
+        
+        # 2. Best model by difficulty
+        for difficulty in ['Easy', 'Medium', 'Hard']:
+            diff_df = df[df['difficulty'] == difficulty]
+            if len(diff_df) > 0:
+                diff_scores = diff_df.groupby('model_name')['total_score'].mean().sort_values(ascending=False)
+                if len(diff_scores) > 0:
+                    results['difficulty_analysis'][difficulty] = diff_scores
+        
+        # 3. Feature importance by model
+        for feature in ['accuracy', 'completeness', 'clarity']:
+            feature_scores = df.groupby('model_name')[feature].mean().sort_values(ascending=False)
+            results['feature_importance'][feature] = feature_scores
+            
+        # 4. Clustering models by performance
+        if len(df) >= 10:
+            # Prepare data for clustering
+            model_features = df.groupby('model_name')[features].mean().reset_index()
+            if len(model_features) > 1:  # Need at least 2 models for meaningful clustering
+                X = model_features[features].values
+                
+                # Standardize the features
+                scaler = StandardScaler()
+                X_scaled = scaler.fit_transform(X)
+                
+                # Determine optimal number of clusters (max 3 or num_models)
+                max_clusters = min(3, len(models))
+                
+                if max_clusters > 1:  # Need at least 2 clusters
+                    # Apply KMeans
+                    kmeans = KMeans(n_clusters=max_clusters, random_state=42)
+                    model_features['cluster'] = kmeans.fit_predict(X_scaled)
+                    
+                    # Store clustering results
+                    results['clustering'] = model_features
+                    
+                    # 5. Apply PCA for visualization
+                    pca = PCA(n_components=2)
+                    principal_components = pca.fit_transform(X_scaled)
+                    
+                    # Store PCA results
+                    results['pca_data'] = principal_components
+                    results['pca_models'] = model_features['model_name'].values
+                    results['pca_variance'] = pca.explained_variance_ratio_
+                    
+        return results, None
+    except Exception as e:
+        return None, f"Error in ML analysis: {str(e)}"
 
 # Function to generate accounting questions using LLM
 def generate_accounting_questions(evaluator_model):
     prompt = """
-    Generate 3 accounting questions with corresponding detailed answers.
-    Questions should be of different difficulty levels:
-    1. Easy: Basic accounting concepts
-    2. Medium: Intermediate accounting principles 
-    3. Hard: Advanced accounting concepts or regulations
+You are a expert accounting educator and professional assessment designer. Your task is to generate exactly three unique accounting questions—one at each difficulty level (Easy, Medium, Hard)—with fully developed answers. Follow these rules to maximize quality:
+
+1. **Distinct Domains**  
+   - Easy: fundamental concept or definition.  
+   - Medium: application or analysis (e.g., journal entries, adjusting entries, financial statement preparation, ratio analysis).  
+   - Hard: evaluation or synthesis on advanced topics (e.g., complex revenue recognition under ASC 606/IFRS 15, lease accounting, business combinations, tax implications).
+
+2. **Question Style**  
+   - Easy: straightforward “what is” or “identify” question.  
+   - Medium & Hard: scenario-based context that requires critical thinking and multi-step reasoning.
+
+3. **Answer Depth**  
+   - Provide at least three sentences.  
+   - Explain the rationale, reference key standards or principles, and highlight common pitfalls.
+
+4. **Output Format**  
+   - A single, valid JSON array of three objects, ordered from Easy to Hard.  
+   - No extra text, markdown, code fences, or comments—only the raw JSON array.
+
+5. **Schema**  
+   Each object must have exactly these keys (no extras):
+   {
+     "difficulty": "Easy" | "Medium" | "Hard",
+     "question": <string>,
+     "answer": <string>
+   }
+
+Ensure the JSON is syntactically correct and complete.
+"""
     
-    Format the output as a JSON array with each question having these fields:
-    - difficulty: "Easy", "Medium", or "Hard"
-    - question: The accounting question
-    - answer: A detailed, comprehensive answer
-    
-    Return only the JSON array, nothing else.
-    """
+    system_prompt = "You are a JSON generator that only outputs valid, well-formatted JSON. Your responses will be directly parsed as JSON objects with no additional processing. Never include explanatory text or anything outside the requested JSON structure."
     
     try:
-        response = query_ollama(evaluator_model, prompt)
+        response = query_ollama(evaluator_model, prompt, system_prompt)
         
-        # Try to extract JSON from the response
-        json_start = response.find('[')
-        json_end = response.rfind(']') + 1
-        
-        if json_start >= 0 and json_end > json_start:
-            json_str = response[json_start:json_end]
-            questions = json.loads(json_str)
-            return questions
-        else:
-            # Fallback questions if JSON parsing fails
+        # Check if response is an error message
+        if response.startswith("Error:"):
+            st.error(f"LLM error: {response}")
             return fallback_questions()
+        
+        # Try different JSON parsing approaches
+        try:
+            # First try: direct JSON parsing of the whole response
+            questions = json.loads(response)
+            if isinstance(questions, list) and len(questions) > 0:
+                # Verify we have 3 questions with proper fields
+                if len(questions) == 3 and all("difficulty" in q and "question" in q and "answer" in q for q in questions):
+                    return questions
+                else:
+                    st.warning(f"LLM returned {len(questions)} questions instead of 3 or missing required fields")
+        except json.JSONDecodeError:
+            # Second try: extract JSON using bracket finding
+            json_start = response.find('[')
+            json_end = response.rfind(']') + 1
+            
+            if json_start >= 0 and json_end > json_start:
+                try:
+                    json_str = response[json_start:json_end]
+                    questions = json.loads(json_str)
+                    if isinstance(questions, list) and len(questions) > 0:
+                        # Verify we have 3 questions with proper fields
+                        if len(questions) == 3 and all("difficulty" in q and "question" in q and "answer" in q for q in questions):
+                            return questions
+                        else:
+                            st.warning(f"LLM returned {len(questions)} questions instead of 3 or missing required fields")
+                except json.JSONDecodeError:
+                    pass  # Continue to fallback
+        
+        # If we got here, JSON parsing failed - log the response for debugging
+        st.warning("LLM did not generate properly formatted questions. Using fallback questions.")
+        st.error(f"Invalid JSON response: {response[:100]}...")  # Show first 100 chars for debugging
+        return fallback_questions()
     except Exception as e:
         st.error(f"Error generating questions: {e}")
         return fallback_questions()
@@ -110,6 +259,12 @@ def init_db():
     conn.commit()
     conn.close()
 
+def verify_admin(username, password):
+    # Simple hardcoded admin credentials instead of database lookup
+    admin_username = os.getenv("ADMIN_USERNAME", "admin")
+    admin_password = os.getenv("ADMIN_PASSWORD", "admin123")
+    return username == admin_username and password == admin_password
+
 def create_new_quiz(evaluator_model):
     conn = sqlite3.connect('db/quiz_results.db')
     c = conn.cursor()
@@ -172,6 +327,9 @@ def save_response(quiz_id, question_text, model_name, response_text, evaluation,
 # API function
 def query_ollama(model, prompt, system=""):
     try:
+        # Set longer timeout for larger models
+        timeout = 300 if "gemma3:12b" in model.lower() else 120
+        
         response = requests.post(
             "http://localhost:11434/api/generate",
             json={
@@ -180,7 +338,7 @@ def query_ollama(model, prompt, system=""):
                 "system": system,
                 "stream": False
             },
-            timeout=60
+            timeout=timeout  # 5 minutes for gemma3:12b, 2 minutes for others
         )
         response.raise_for_status()
         return response.json()["response"]
@@ -264,13 +422,21 @@ if 'quiz_id' not in st.session_state:
     st.session_state.quiz_id = None
 if 'accounting_questions' not in st.session_state:
     st.session_state.accounting_questions = []
+if 'admin_logged_in' not in st.session_state:
+    st.session_state.admin_logged_in = False
+if 'current_question_index' not in st.session_state:
+    st.session_state.current_question_index = 0
+if 'current_model_index' not in st.session_state:
+    st.session_state.current_model_index = 0
+if 'questions_generated' not in st.session_state:
+    st.session_state.questions_generated = False
 
 # Initialize database
 init_db()
 
 # Main app
-st.title("🧮 Accounting Knowledge Quiz with Ollama LLM")
-st.markdown("This app tests different LLM models on accounting knowledge and determines the winner.")
+st.title("🧮 LLM Benchmarking for Accounting")
+st.markdown("This tool benchmarks large language models (LLMs) on their accounting knowledge, evaluating responses for accuracy, completeness, and clarity.")
 
 # Sidebar for configuration
 with st.sidebar:
@@ -285,20 +451,20 @@ with st.sidebar:
         st.warning("Could not fetch models from Ollama. Using default list.")
     
     # Model selection
-    st.subheader("Select models to test")
+    st.subheader("Select Models to Benchmark")
     model_selections = {}
     for model in available_models:
         model_selections[model] = st.checkbox(model, value=model in ["llama3", "mistral"] if len(st.session_state.models_to_test) == 0 else model in st.session_state.models_to_test)
     
     # Evaluator model
     evaluator_model = st.selectbox(
-        "Select evaluator model",
+        "Select Evaluator Model",
         available_models,
         index=available_models.index("llama3") if "llama3" in available_models else 0
     )
     
     # Start button
-    if st.button("Start Quiz"):
+    if st.button("Start Benchmark"):
         st.session_state.models_to_test = [model for model, selected in model_selections.items() if selected]
         st.session_state.evaluator_model = evaluator_model
         st.session_state.scores = {model: 0 for model in st.session_state.models_to_test}
@@ -306,10 +472,14 @@ with st.sidebar:
         st.session_state.quiz_complete = False
         st.session_state.processing = True
         st.session_state.quiz_id = create_new_quiz(evaluator_model)
+        st.session_state.questions_generated = False
+        st.session_state.current_question_index = 0
+        st.session_state.current_model_index = 0
         
         # Generate questions with the evaluator model
         with st.spinner("Generating accounting questions..."):
             st.session_state.accounting_questions = generate_accounting_questions(evaluator_model)
+            st.session_state.questions_generated = True
         
         st.rerun()
     
@@ -328,64 +498,483 @@ with st.sidebar:
         st.markdown(f"**Total model responses:** {num_responses}")
     except Exception:
         st.warning("Database statistics not available.")
+    
+    # Admin login section - moved to bottom of sidebar
+    st.markdown("---")
+    st.subheader("Admin Login")
+    
+    if not st.session_state.admin_logged_in:
+        with st.form("admin_login"):
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            submit_button = st.form_submit_button("Login")
+            
+            if submit_button:
+                if verify_admin(username, password):
+                    st.session_state.admin_logged_in = True
+                    st.success("Login successful!")
+                    st.rerun()
+                else:
+                    st.error("Invalid username or password")
+    else:
+        st.success("Admin logged in")
+        
+        # Add debug option for question generation
+        with st.expander("🛠️ Admin Debug Tools"):
+            test_model = st.selectbox(
+                "Select model for testing",
+                available_models,
+                index=available_models.index("llama3") if "llama3" in available_models else 0
+            )
+            
+            if st.button("Test Question Generation"):
+                with st.spinner("Testing question generation..."):
+                    test_questions = generate_accounting_questions(test_model)
+                    
+                    st.subheader("Generated Questions")
+                    if test_questions and len(test_questions) > 0:
+                        st.success(f"Successfully generated {len(test_questions)} questions!")
+                        st.json(test_questions)
+                    else:
+                        st.error("Failed to generate questions, fallback used")
+                        st.json(test_questions)
+        
+        if st.button("Logout"):
+            st.session_state.admin_logged_in = False
+            st.rerun()
 
 # Main content
-if len(st.session_state.models_to_test) > 0:
-    # Process all quiz questions at once in the background
-    if st.session_state.processing and not st.session_state.quiz_complete:
-        with st.spinner("Processing all questions... This may take a minute..."):
-            # Get responses from all models for all questions
-            for q_idx, current_q in enumerate(st.session_state.accounting_questions):
-                if q_idx not in st.session_state.responses:
-                    st.session_state.responses[q_idx] = {}
-                
-                for model in st.session_state.models_to_test:
-                    response = query_ollama(model, current_q['question'], 
-                                          "You are an expert accountant. Provide a detailed and accurate answer to the accounting question.")
+if st.session_state.admin_logged_in and len(st.session_state.models_to_test) == 0:
+    # Show Database Review Interface in main content when admin is logged in and no quiz is running
+    tabs = st.tabs(["SQL Database Review", "ML Model Analysis"])
+    
+    # SQL Database Review Tab
+    with tabs[0]:
+        st.header("SQL Database Review")
+        st.markdown("**Run SQL queries directly on the database**")
+        
+        # Sample queries dropdown
+        sample_queries = {
+            "Select a sample query": "",
+            "All tables in database": "SELECT name FROM sqlite_master WHERE type='table';",
+            "All quiz results": """
+                    SELECT 
+                        q.quiz_id, q.timestamp, q.evaluator_model,
+                        ques.question_id, ques.difficulty, ques.question_text,
+                        r.response_id, r.model_name, r.response_text, 
+                        r.accuracy, r.completeness, r.clarity, r.total_score, r.feedback
+                    FROM quizzes q
+                    JOIN responses r ON q.quiz_id = r.quiz_id
+                    JOIN questions ques ON r.question_id = ques.question_id
+            ORDER BY q.timestamp DESC LIMIT 100;
+            """,
+            "Quiz performance by model": """
+            SELECT 
+                r.model_name, 
+                AVG(r.total_score) as avg_score,
+                COUNT(*) as total_responses
+            FROM responses r
+            GROUP BY r.model_name
+            ORDER BY avg_score DESC;
+            """,
+            "Questions by difficulty": """
+            SELECT difficulty, COUNT(*) as count
+            FROM questions
+            GROUP BY difficulty
+            ORDER BY 
+                CASE difficulty 
+                    WHEN 'Easy' THEN 1 
+                    WHEN 'Medium' THEN 2 
+                    WHEN 'Hard' THEN 3 
+                    ELSE 4 
+                END;
+            """
+        }
+        
+        selected_sample = st.selectbox("Sample queries", options=list(sample_queries.keys()))
+        
+        # SQL query input
+        sql_query = st.text_area(
+            "Enter SQL query", 
+            value=sample_queries[selected_sample],
+            height=150,
+            help="Enter your SQL query here. SELECT queries only for safety."
+        )
+        
+        # Safety check for non-SELECT queries
+        is_select = sql_query.strip().upper().startswith("SELECT")
+        is_pragma = sql_query.strip().upper().startswith("PRAGMA")
+        
+        if st.button("Run Query"):
+            if not sql_query:
+                st.warning("Please enter a SQL query")
+            elif not (is_select or is_pragma):
+                st.error("Only SELECT and PRAGMA queries are allowed for safety reasons")
+            else:
+                try:
+                    conn = sqlite3.connect('db/quiz_results.db')
                     
-                    st.session_state.responses[q_idx][model] = {
-                        "response": response,
-                        "evaluation": None
-                    }
+                    # Execute query and convert to DataFrame
+                    results_df = pd.read_sql_query(sql_query, conn)
+                    conn.close()
                     
-                    # Evaluate the response
-                    if not response.startswith("Error:"):
-                        evaluation = evaluate_response(
-                            current_q['question'],
-                            current_q['answer'],
-                            response,
-                            st.session_state.evaluator_model
-                        )
-                    else:
-                        evaluation = {
-                            "accuracy": 0,
-                            "completeness": 0,
-                            "clarity": 0,
-                            "total_score": 0,
-                            "feedback": "Response contained an error and could not be evaluated."
-                        }
-                    
-                    st.session_state.responses[q_idx][model]["evaluation"] = evaluation
-                    st.session_state.scores[model] += evaluation.get("total_score", 0)
-                    
-                    # Save to database
-                    save_response(
-                        st.session_state.quiz_id,
-                        current_q['question'],
-                        model,
-                        response,
-                        evaluation,
-                        st.session_state.evaluator_model
+                    # Display results
+                    st.subheader("Query Results")
+                    st.dataframe(
+                        results_df, 
+                        use_container_width=True,
+                        hide_index=False
                     )
+                    
+                    # Show row count
+                    st.info(f"Retrieved {len(results_df)} records")
+                    
+                    # Export option
+                    if not results_df.empty and st.button("Export Results to CSV"):
+                        # Create the exports directory if it doesn't exist
+                        if not os.path.exists('exports'):
+                            os.makedirs('exports')
+                        
+                        # Export to CSV
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        export_path = f"exports/query_results_{timestamp}.csv"
+                        results_df.to_csv(export_path, index=False)
+                        
+                        st.success(f"Data exported to {export_path}")
+                        
+                except Exception as e:
+                    st.error(f"Error executing query: {e}")
+    
+    # ML Model Analysis Tab
+    with tabs[1]:
+        st.header("ML Model Analysis")
+        st.markdown("**Machine Learning Analysis to Determine the Best Model for Accounting**")
+        
+        if st.button("Run Analysis"):
+            with st.spinner("Running ML analysis on quiz results..."):
+                try:
+                    conn = sqlite3.connect('db/quiz_results.db')
+                    
+                    # First check if we have enough data
+                    c = conn.cursor()
+                    c.execute("SELECT COUNT(*) FROM responses WHERE accuracy IS NOT NULL")
+                    count = c.fetchone()[0]
+                    
+                    if count < 10:
+                        st.warning("Not enough data for analysis. Need at least 10 quiz responses.")
+                    else:
+                        # Run the ML analysis
+                        results, error = analyze_model_performance(conn)
+                        
+                        if error:
+                            st.error(error)
+                        else:
+                            # Display overall best model
+                            st.subheader("Overall Best Model")
+                            best_model = results['overall_best']
+                            best_score = results['avg_scores'][best_model]
+                            
+                            # Create a fancy metric display for the best model
+                            st.markdown(f"""
+                            <div style='background-color: #f0f7ff; padding: 20px; border-radius: 10px; border: 1px solid #d0e3ff;'>
+                                <h2 style='text-align: center; margin-bottom: 10px;'>{best_model}</h2>
+                                <h3 style='text-align: center; color: #1f77b4;'>Score: {best_score:.2f}/30</h3>
+                                <p style='text-align: center;'>🏆 Best Overall Model for Accounting</p>
+                            </div>
+                            """, unsafe_allow_html=True)
+                            
+                            # Display average scores for all models
+                            st.subheader("Average Performance by Model")
+                            
+                            # Convert scores to dataframe for charting
+                            avg_scores_df = results['avg_scores'].reset_index()
+                            avg_scores_df.columns = ['Model', 'Average Score']
+                            
+                            # Display as bar chart
+                            fig, ax = plt.subplots(figsize=(10, 6))
+                            sns.barplot(x='Model', y='Average Score', data=avg_scores_df, ax=ax, palette='viridis')
+                            ax.set_title('Average Model Performance')
+                            ax.set_ylim(0, 30)  # Max score is 30
+                            st.pyplot(fig)
+                            
+                            # Display performance by difficulty
+                            st.subheader("Performance by Question Difficulty")
+                            
+                            diff_scores = {}
+                            for difficulty, scores in results['difficulty_analysis'].items():
+                                diff_scores[difficulty] = scores.reset_index()
+                                diff_scores[difficulty].columns = ['Model', f'{difficulty} Score']
+                            
+                            if diff_scores:
+                                # Create separate charts for each difficulty
+                                fig, axes = plt.subplots(1, len(diff_scores), figsize=(15, 5))
+                                if len(diff_scores) == 1:
+                                    axes = [axes]  # Make it iterable if only one difficulty
+                                    
+                                for i, (difficulty, df) in enumerate(diff_scores.items()):
+                                    sns.barplot(x='Model', y=f'{difficulty} Score', data=df, ax=axes[i], palette='viridis')
+                                    axes[i].set_title(f'{difficulty} Questions')
+                                    axes[i].set_ylim(0, 30)
+                                    # Rotate labels if needed
+                                    axes[i].set_xticklabels(axes[i].get_xticklabels(), rotation=45, ha='right')
+                                    
+                                plt.tight_layout()
+                                st.pyplot(fig)
+                            
+                            # Feature importance analysis
+                            st.subheader("Model Strengths by Criteria")
+                            
+                            feature_names = {'accuracy': 'Accuracy', 'completeness': 'Completeness', 'clarity': 'Clarity'}
+                            feature_dfs = []
+                            
+                            for feature, scores in results['feature_importance'].items():
+                                feature_df = scores.reset_index()
+                                feature_df.columns = ['Model', feature_names[feature]]
+                                feature_dfs.append(feature_df)
+                            
+                            # Merge all feature dataframes
+                            if feature_dfs:
+                                feature_analysis = feature_dfs[0]
+                                for df in feature_dfs[1:]:
+                                    feature_analysis = feature_analysis.merge(df, on='Model')
+                                
+                                # Create a heatmap
+                                plt.figure(figsize=(10, 6))
+                                feature_matrix = feature_analysis.set_index('Model')
+                                sns.heatmap(feature_matrix, annot=True, cmap='viridis', linewidths=.5, fmt='.1f')
+                                plt.title('Model Performance by Criteria')
+                                st.pyplot(plt)
+                            
+                            # Clustering results
+                            if results['clustering'] is not None:
+                                st.subheader("Model Clustering Analysis")
+                                
+                                # Display cluster assignments
+                                cluster_df = results['clustering'][['model_name', 'cluster']].copy()
+                                cluster_df.columns = ['Model', 'Cluster']
+                                
+                                # Create meaningful cluster labels
+                                cluster_means = results['clustering'].groupby('cluster')[['accuracy', 'completeness', 'clarity', 'difficulty_encoded']].mean()
+                                cluster_means['total'] = cluster_means.sum(axis=1)
+                                cluster_ranks = cluster_means['total'].rank(ascending=False).astype(int)
+                                
+                                # Map cluster numbers to performance tiers
+                                tier_map = {cluster: f"Tier {rank}" for cluster, rank in cluster_ranks.items()}
+                                cluster_df['Performance Tier'] = cluster_df['Cluster'].map(tier_map)
+                                
+                                # Show cluster assignments
+                                st.write("Models grouped by performance similarity:")
+                                st.dataframe(cluster_df[['Model', 'Performance Tier']], use_container_width=True)
+                                
+                                # Display PCA visualization if available
+                                if results['pca_data'] is not None:
+                                    st.subheader("Model Performance Space (PCA)")
+                                    
+                                    # Create PCA visualization
+                                    pca_df = pd.DataFrame(
+                                        data=results['pca_data'], 
+                                        columns=['Principal Component 1', 'Principal Component 2']
+                                    )
+                                    pca_df['Model'] = results['pca_models']
+                                    pca_df = pca_df.merge(cluster_df, on='Model')
+                                    
+                                    # Calculate variance explained
+                                    variance_explained = results['pca_variance']
+                                    
+                                    fig, ax = plt.subplots(figsize=(10, 8))
+                                    sns.scatterplot(
+                                        data=pca_df, 
+                                        x='Principal Component 1', 
+                                        y='Principal Component 2', 
+                                        hue='Performance Tier',
+                                        s=200,
+                                        palette='viridis',
+                                        ax=ax
+                                    )
+                                    
+                                    # Add model names as annotations
+                                    for idx, row in pca_df.iterrows():
+                                        ax.annotate(
+                                            row['Model'], 
+                                            (row['Principal Component 1'], row['Principal Component 2']),
+                                            xytext=(5, 5),
+                                            textcoords='offset points',
+                                            fontsize=10
+                                        )
+                                    
+                                    # Add variance explained to axis labels
+                                    ax.set_xlabel(f"Principal Component 1 ({variance_explained[0]:.2%} variance)")
+                                    ax.set_ylabel(f"Principal Component 2 ({variance_explained[1]:.2%} variance)")
+                                    ax.set_title("Model Performance Clustering in 2D Space")
+                                    
+                                    st.pyplot(fig)
+                                    
+                                    # Explanation
+                                    st.info("""
+                                    **Interpretation:** 
+                                    - Models clustered together have similar performance patterns
+                                    - Distance between models indicates how differently they perform
+                                    - The axes represent the main factors of variation in model performance
+                                    """)
+                                    
+                            # Conclusion section
+                            st.subheader("Conclusion")
+                            recommendation = f"""
+                            Based on the machine learning analysis of the quiz results, **{best_model}** is the best 
+                            performing model for accounting tasks with an average score of {best_score:.2f}/30.
+                            """
+                            
+                            # Check if we have difficulty-specific recommendations
+                            best_by_difficulty = {}
+                            for difficulty, scores in results['difficulty_analysis'].items():
+                                if not scores.empty:
+                                    best_by_difficulty[difficulty] = scores.index[0]
+                            
+                            if len(best_by_difficulty) > 0:
+                                recommendation += "\n\n**Best model by difficulty level:**"
+                                for difficulty, model in best_by_difficulty.items():
+                                    recommendation += f"\n- {difficulty} questions: **{model}**"
+                            
+                            st.markdown(recommendation)
+                    
+                    conn.close()
+                    
+                except Exception as e:
+                    st.error(f"Error during machine learning analysis: {str(e)}")
+        
+        # Documentation for the ML analysis
+        with st.expander("How the Analysis Works"):
+            st.markdown("""
+            ### Machine Learning Methodology
             
-            st.session_state.processing = False
-            st.session_state.quiz_complete = True
+            This analysis uses several machine learning techniques to determine the best model for accounting tasks:
+            
+            1. **Basic Statistical Analysis**
+               - Average scores by model
+               - Performance breakdown by question difficulty
+               - Performance by evaluation criteria (accuracy, completeness, clarity)
+            
+            2. **Clustering (K-Means)**
+               - Groups models by similar performance patterns
+               - Helps identify performance tiers
+            
+            3. **Dimensionality Reduction (PCA)**
+               - Visualizes model performance in 2D space
+               - Shows relationships between models
+            
+            ### Data Used
+            
+            The analysis uses all quiz responses with evaluation data, including:
+            - Model accuracy scores
+            - Model completeness scores
+            - Model clarity scores 
+            - Question difficulty
+            
+            ### Minimum Requirements
+            
+            At least 10 evaluated responses are needed for meaningful analysis.
+            """)
+        
+    # Return to quiz mode info
+    st.markdown("---")
+    st.info("To run a quiz, select models in the sidebar and click 'Start Benchmark'.")
+elif len(st.session_state.models_to_test) > 0:
+    # Display generated questions first
+    if st.session_state.questions_generated and not st.session_state.quiz_complete:
+        st.header("Accounting Questions")
+        
+        # Display the 3 questions with difficulty levels
+        for i, question in enumerate(st.session_state.accounting_questions):
+            with st.container(border=True):
+                st.subheader(f"{question['difficulty']} Question")
+                st.markdown(f"**Q{i+1}:** {question['question']}")
+        
+        # Process questions one by one
+        if st.session_state.processing:
+            st.header("Processing Questions")
+            
+            total_questions = len(st.session_state.accounting_questions)
+            total_models = len(st.session_state.models_to_test)
+            
+            # Calculate overall progress percentage
+            total_combinations = total_questions * total_models
+            current_combination = (st.session_state.current_question_index * total_models) + st.session_state.current_model_index
+            overall_progress = current_combination / total_combinations
+            
+            # Show overall progress
+            st.progress(overall_progress)
+            
+            # Show current status
+            current_question = st.session_state.accounting_questions[st.session_state.current_question_index]
+            current_model = st.session_state.models_to_test[st.session_state.current_model_index]
+            
+            st.info(f"Processing {current_question['difficulty']} Question ({st.session_state.current_question_index+1}/{total_questions}) with model: **{current_model}**")
+            
+            # Process current question/model combination
+            q_idx = st.session_state.current_question_index
+            model = current_model
+            
+            # Initialize response dictionary if needed
+            if q_idx not in st.session_state.responses:
+                st.session_state.responses[q_idx] = {}
+            
+            # Get response for current question/model
+            response = query_ollama(model, current_question['question'], 
+                                   "You are an expert accountant. Provide a detailed and accurate answer to the accounting question.")
+            
+            st.session_state.responses[q_idx][model] = {
+                "response": response,
+                "evaluation": None
+            }
+            
+            # Evaluate the response
+            if not response.startswith("Error:"):
+                evaluation = evaluate_response(
+                    current_question['question'],
+                    current_question['answer'],
+                    response,
+                    st.session_state.evaluator_model
+                )
+            else:
+                evaluation = {
+                    "accuracy": 0,
+                    "completeness": 0,
+                    "clarity": 0,
+                    "total_score": 0,
+                    "feedback": "Response contained an error and could not be evaluated."
+                }
+            
+            st.session_state.responses[q_idx][model]["evaluation"] = evaluation
+            st.session_state.scores[model] += evaluation.get("total_score", 0)
+            
+            # Save to database
+            save_response(
+                st.session_state.quiz_id,
+                current_question['question'],
+                model,
+                response,
+                evaluation,
+                st.session_state.evaluator_model
+            )
+            
+            # Update indices for next iteration
+            st.session_state.current_model_index += 1
+            if st.session_state.current_model_index >= total_models:
+                st.session_state.current_model_index = 0
+                st.session_state.current_question_index += 1
+            
+            # Check if we're done processing all questions
+            if st.session_state.current_question_index >= total_questions:
+                st.session_state.processing = False
+                st.session_state.quiz_complete = True
+            
+            # Rerun to show progress or complete
             st.rerun()
     
     # Show progress while processing
-    if st.session_state.processing:
-        st.info("Quiz is running... Please wait while we process all questions.")
-        st.progress(0.5)  # Show indeterminate progress
+    if st.session_state.processing and not st.session_state.questions_generated:
+        st.info("Generating questions... Please wait.")
+        st.progress(0.1)  # Show initial progress
     
     # Display final results
     elif st.session_state.quiz_complete:
@@ -512,8 +1101,17 @@ if len(st.session_state.models_to_test) > 0:
             st.session_state.processing = False
             st.session_state.quiz_id = None
             st.session_state.accounting_questions = []
+            st.session_state.current_question_index = 0
+            st.session_state.current_model_index = 0
+            st.session_state.questions_generated = False
             st.rerun()
     else:
         st.info("Starting quiz... Please wait.")
 else:
-    st.info("👈 Please select models to test in the sidebar and click 'Start Quiz'")
+    # Default view for non-admin users or before quiz starts
+    st.info("👈 Please select models to test in the sidebar and click 'Start Benchmark'")
+    
+    # If user is not logged in as admin, show a message about admin features
+    if not st.session_state.admin_logged_in:
+        st.markdown("---")
+        st.markdown("**Admin users:** Log in through the sidebar to access the database review interface.")
