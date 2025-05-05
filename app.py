@@ -11,6 +11,7 @@ from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt
 import seaborn as sns
+import tiktoken
 
 
 st.set_page_config(page_title="LLM Benchmarking for Accounting", page_icon="💼", layout="wide")
@@ -124,7 +125,7 @@ You are a expert accounting educator and professional assessment designer. Your 
    - Hard: evaluation or synthesis on advanced topics (e.g., complex revenue recognition under ASC 606/IFRS 15, lease accounting, business combinations, tax implications).
 
 2. **Question Style**  
-   - Easy: straightforward “what is” or “identify” question.  
+   - Easy: straightforward "what is" or "identify" question.  
    - Medium & Hard: scenario-based context that requires critical thinking and multi-step reasoning.
 
 3. **Answer Depth**  
@@ -149,7 +150,8 @@ Ensure the JSON is syntactically correct and complete.
     system_prompt = "You are a JSON generator that only outputs valid, well-formatted JSON. Your responses will be directly parsed as JSON objects with no additional processing. Never include explanatory text or anything outside the requested JSON structure."
     
     try:
-        response = query_ollama(evaluator_model, prompt, system_prompt)
+        response_data = query_ollama(evaluator_model, prompt, system_prompt)
+        response = response_data["response"]
         
         # Check if response is an error message
         if response.startswith("Error:"):
@@ -251,10 +253,38 @@ def init_db():
         total_score INTEGER,
         feedback TEXT,
         evaluator_model TEXT,
+        response_time REAL,
+        prompt_tokens INTEGER,
+        completion_tokens INTEGER,
+        total_tokens INTEGER,
+        final_score REAL,
         FOREIGN KEY (quiz_id) REFERENCES quizzes (quiz_id),
         FOREIGN KEY (question_id) REFERENCES questions (question_id)
     )
     ''')
+    
+    # Check if we need to add the new columns to an existing table
+    c.execute("PRAGMA table_info(responses)")
+    columns = c.fetchall()
+    column_names = [column[1] for column in columns]
+    
+    # Add response_time column if it doesn't exist
+    if 'response_time' not in column_names:
+        c.execute("ALTER TABLE responses ADD COLUMN response_time REAL")
+    
+    # Add token columns if they don't exist
+    if 'prompt_tokens' not in column_names:
+        c.execute("ALTER TABLE responses ADD COLUMN prompt_tokens INTEGER")
+    
+    if 'completion_tokens' not in column_names:
+        c.execute("ALTER TABLE responses ADD COLUMN completion_tokens INTEGER")
+    
+    if 'total_tokens' not in column_names:
+        c.execute("ALTER TABLE responses ADD COLUMN total_tokens INTEGER")
+    
+    # Add final_score column if it doesn't exist
+    if 'final_score' not in column_names:
+        c.execute("ALTER TABLE responses ADD COLUMN final_score REAL")
     
     conn.commit()
     conn.close()
@@ -300,12 +330,16 @@ def save_response(quiz_id, question_text, model_name, response_text, evaluation,
                         ("Unknown", question_text, ""))
                 question_id = c.lastrowid
         
+        # Calculate final_score if not already present in evaluation
+        final_score = evaluation.get("final_score", 0.0)
+        
         # Save response
         c.execute('''
         INSERT INTO responses (
             quiz_id, question_id, model_name, response_text, 
-            accuracy, completeness, clarity, total_score, feedback, evaluator_model
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            accuracy, completeness, clarity, total_score, feedback, evaluator_model, 
+            response_time, prompt_tokens, completion_tokens, total_tokens, final_score
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             quiz_id, 
             question_id, 
@@ -316,7 +350,12 @@ def save_response(quiz_id, question_text, model_name, response_text, evaluation,
             evaluation.get("clarity", 0), 
             evaluation.get("total_score", 0), 
             evaluation.get("feedback", ""),
-            evaluator_model
+            evaluator_model,
+            evaluation.get("response_time", 0),
+            evaluation.get("prompt_tokens", 0),
+            evaluation.get("completion_tokens", 0),
+            evaluation.get("total_tokens", 0),
+            final_score
         ))
         
         conn.commit()
@@ -324,11 +363,51 @@ def save_response(quiz_id, question_text, model_name, response_text, evaluation,
     except Exception as e:
         st.error(f"Error saving to database: {e}")
 
+def get_tiktoken_encoding(model_name):
+    """
+    Get the appropriate tiktoken encoding based on the model name.
+    Falls back to cl100k_base for most models as a reasonable default.
+    """
+    # Map Ollama model families to OpenAI encoding schemes (approximate mapping)
+    if "llama" in model_name.lower():
+        # Llama models - use cl100k_base as closest approximation
+        return tiktoken.get_encoding("cl100k_base")
+    elif "mistral" in model_name.lower():
+        # Mistral models - use cl100k_base as closest approximation
+        return tiktoken.get_encoding("cl100k_base")
+    elif "gemma" in model_name.lower():
+        # Gemma models - use cl100k_base as closest approximation
+        return tiktoken.get_encoding("cl100k_base")
+    elif "gpt-3.5" in model_name.lower() or "gpt-4" in model_name.lower():
+        # GPT models - use encoding_for_model for most accurate encoding
+        return tiktoken.encoding_for_model(model_name)
+    else:
+        # Default to cl100k_base for unknown models (most recent encoding)
+        return tiktoken.get_encoding("cl100k_base")
+
+# Helper function to get question_id from question_text
+def question_id_for_text(conn, question_text):
+    c = conn.cursor()
+    c.execute("SELECT question_id FROM questions WHERE question_text = ?", (question_text,))
+    result = c.fetchone()
+    if result:
+        return result[0]
+    return None
+
 # API function
 def query_ollama(model, prompt, system=""):
     try:
         # Set longer timeout for larger models
-        timeout = 300 if "gemma3:12b" in model.lower() else 120
+        timeout = 2000 if "gemma3:12b" in model.lower() else 120
+        
+        # Record start time
+        start_time = datetime.now()
+        
+        # Calculate prompt token count using tiktoken
+        encoding = get_tiktoken_encoding(model)
+        prompt_tokens = len(encoding.encode(prompt))
+        system_tokens = len(encoding.encode(system)) if system else 0
+        total_prompt_tokens = prompt_tokens + system_tokens
         
         response = requests.post(
             "http://localhost:11434/api/generate",
@@ -341,19 +420,47 @@ def query_ollama(model, prompt, system=""):
             timeout=timeout  # 5 minutes for gemma3:12b, 2 minutes for others
         )
         response.raise_for_status()
-        return response.json()["response"]
+        
+        # Get response text
+        response_text = response.json()["response"]
+        
+        # Calculate response time in seconds
+        end_time = datetime.now()
+        response_time = (end_time - start_time).total_seconds()
+        
+        # Calculate response token count
+        completion_tokens = len(encoding.encode(response_text))
+        
+        # Return response text and metadata
+        return {
+            "response": response_text,
+            "response_time": response_time,
+            "prompt_tokens": total_prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_prompt_tokens + completion_tokens
+        }
     except Exception as e:
-        return f"Error: {str(e)}"
+        return {
+            "response": f"Error: {str(e)}",
+            "response_time": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0
+        }
 
 def evaluate_response(question, correct_answer, model_response, evaluator_model):
     # Skip evaluation if the response is an error message
-    if model_response.startswith("Error:"):
+    if model_response["response"].startswith("Error:"):
         return {
             "accuracy": 0,
             "completeness": 0,
             "clarity": 0,
             "total_score": 0,
-            "feedback": "Response contained an error and could not be evaluated."
+            "feedback": "Response contained an error and could not be evaluated.",
+            "response_time": model_response.get("response_time", 0),
+            "prompt_tokens": model_response.get("prompt_tokens", 0),
+            "completion_tokens": model_response.get("completion_tokens", 0),
+            "total_tokens": model_response.get("total_tokens", 0)
         }
         
     evaluation_prompt = f"""
@@ -363,7 +470,7 @@ def evaluate_response(question, correct_answer, model_response, evaluator_model)
     
     Correct answer concepts: {correct_answer}
     
-    Model's response: {model_response}
+    Model's response: {model_response["response"]}
     
     Please evaluate the response on a scale of 0-10 based on:
     1. Accuracy (0-10): How factually correct is the response?
@@ -385,18 +492,28 @@ def evaluate_response(question, correct_answer, model_response, evaluator_model)
     try:
         evaluation_result = query_ollama(evaluator_model, evaluation_prompt)
         # Extract JSON from the response
-        json_start = evaluation_result.find('{')
-        json_end = evaluation_result.rfind('}') + 1
+        json_start = evaluation_result["response"].find('{')
+        json_end = evaluation_result["response"].rfind('}') + 1
         if json_start >= 0 and json_end > json_start:
-            json_str = evaluation_result[json_start:json_end]
-            return json.loads(json_str)
+            json_str = evaluation_result["response"][json_start:json_end]
+            evaluation = json.loads(json_str)
+            # Add response time and token count from the original response
+            evaluation["response_time"] = model_response.get("response_time", 0)
+            evaluation["prompt_tokens"] = model_response.get("prompt_tokens", 0)
+            evaluation["completion_tokens"] = model_response.get("completion_tokens", 0)
+            evaluation["total_tokens"] = model_response.get("total_tokens", 0)
+            return evaluation
         else:
             return {
                 "accuracy": 5,
                 "completeness": 5,
                 "clarity": 5,
                 "total_score": 15,
-                "feedback": "Error parsing evaluation"
+                "feedback": "Error parsing evaluation",
+                "response_time": model_response.get("response_time", 0),
+                "prompt_tokens": model_response.get("prompt_tokens", 0),
+                "completion_tokens": model_response.get("completion_tokens", 0),
+                "total_tokens": model_response.get("total_tokens", 0)
             }
     except Exception:
         return {
@@ -404,7 +521,11 @@ def evaluate_response(question, correct_answer, model_response, evaluator_model)
             "completeness": 5,
             "clarity": 5,
             "total_score": 15,
-            "feedback": "Error during evaluation"
+            "feedback": "Error during evaluation",
+            "response_time": model_response.get("response_time", 0),
+            "prompt_tokens": model_response.get("prompt_tokens", 0),
+            "completion_tokens": model_response.get("completion_tokens", 0),
+            "total_tokens": model_response.get("total_tokens", 0)
         }
 
 # Initialize session state
@@ -494,7 +615,7 @@ with st.sidebar:
         num_responses = c.fetchone()[0]
         conn.close()
         
-        st.markdown(f"**Total quizzes run:** {num_quizzes}")
+        st.markdown(f"**Total benchmarks run:** {num_quizzes}")
         st.markdown(f"**Total model responses:** {num_responses}")
     except Exception:
         st.warning("Database statistics not available.")
@@ -562,7 +683,8 @@ if st.session_state.admin_logged_in and len(st.session_state.models_to_test) == 
                         q.quiz_id, q.timestamp, q.evaluator_model,
                         ques.question_id, ques.difficulty, ques.question_text,
                         r.response_id, r.model_name, r.response_text, 
-                        r.accuracy, r.completeness, r.clarity, r.total_score, r.feedback
+                        r.accuracy, r.completeness, r.clarity, r.total_score, r.feedback,
+                        r.response_time, r.prompt_tokens, r.completion_tokens, r.total_tokens, r.final_score
                     FROM quizzes q
                     JOIN responses r ON q.quiz_id = r.quiz_id
                     JOIN questions ques ON r.question_id = ques.question_id
@@ -630,17 +752,19 @@ if st.session_state.admin_logged_in and len(st.session_state.models_to_test) == 
                     st.info(f"Retrieved {len(results_df)} records")
                     
                     # Export option
-                    if not results_df.empty and st.button("Export Results to CSV"):
-                        # Create the exports directory if it doesn't exist
-                        if not os.path.exists('exports'):
-                            os.makedirs('exports')
-                        
-                        # Export to CSV
+                    if not results_df.empty:
+                        # Create CSV data for download
+                        csv_data = results_df.to_csv(index=False)
                         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        export_path = f"exports/query_results_{timestamp}.csv"
-                        results_df.to_csv(export_path, index=False)
+                        filename = f"query_results_{timestamp}.csv"
                         
-                        st.success(f"Data exported to {export_path}")
+                        # Use Streamlit's download button instead of regular button
+                        st.download_button(
+                            label="Export Results to CSV",
+                            data=csv_data,
+                            file_name=filename,
+                            mime="text/csv"
+                        )
                         
                 except Exception as e:
                     st.error(f"Error executing query: {e}")
@@ -651,7 +775,7 @@ if st.session_state.admin_logged_in and len(st.session_state.models_to_test) == 
         st.markdown("**Machine Learning Analysis to Determine the Best Model for Accounting**")
         
         if st.button("Run Analysis"):
-            with st.spinner("Running ML analysis on quiz results..."):
+            with st.spinner("Running ML analysis on benchmark results..."):
                 try:
                     conn = sqlite3.connect('db/quiz_results.db')
                     
@@ -877,7 +1001,7 @@ if st.session_state.admin_logged_in and len(st.session_state.models_to_test) == 
         
     # Return to quiz mode info
     st.markdown("---")
-    st.info("To run a quiz, select models in the sidebar and click 'Start Benchmark'.")
+    st.info("To run a benchmark, select models in the sidebar and click 'Start Benchmark'.")
 elif len(st.session_state.models_to_test) > 0:
     # Display generated questions first
     if st.session_state.questions_generated and not st.session_state.quiz_complete:
@@ -919,20 +1043,24 @@ elif len(st.session_state.models_to_test) > 0:
                 st.session_state.responses[q_idx] = {}
             
             # Get response for current question/model
-            response = query_ollama(model, current_question['question'], 
+            response_data = query_ollama(model, current_question['question'], 
                                    "You are an expert accountant. Provide a detailed and accurate answer to the accounting question.")
             
             st.session_state.responses[q_idx][model] = {
-                "response": response,
+                "response": response_data["response"],
+                "response_time": response_data["response_time"],
+                "prompt_tokens": response_data["prompt_tokens"],
+                "completion_tokens": response_data["completion_tokens"],
+                "total_tokens": response_data["total_tokens"],
                 "evaluation": None
             }
             
             # Evaluate the response
-            if not response.startswith("Error:"):
+            if not response_data["response"].startswith("Error:"):
                 evaluation = evaluate_response(
                     current_question['question'],
                     current_question['answer'],
-                    response,
+                    response_data,
                     st.session_state.evaluator_model
                 )
             else:
@@ -941,8 +1069,15 @@ elif len(st.session_state.models_to_test) > 0:
                     "completeness": 0,
                     "clarity": 0,
                     "total_score": 0,
-                    "feedback": "Response contained an error and could not be evaluated."
+                    "feedback": "Response contained an error and could not be evaluated.",
+                    "response_time": response_data["response_time"],
+                    "prompt_tokens": response_data["prompt_tokens"],
+                    "completion_tokens": response_data["completion_tokens"],
+                    "total_tokens": response_data["total_tokens"]
                 }
+            
+            # We can't calculate final_score yet because we need min/max values across all responses
+            # This will be calculated later in the results display
             
             st.session_state.responses[q_idx][model]["evaluation"] = evaluation
             st.session_state.scores[model] += evaluation.get("total_score", 0)
@@ -952,7 +1087,7 @@ elif len(st.session_state.models_to_test) > 0:
                 st.session_state.quiz_id,
                 current_question['question'],
                 model,
-                response,
+                response_data["response"],
                 evaluation,
                 st.session_state.evaluator_model
             )
@@ -980,11 +1115,128 @@ elif len(st.session_state.models_to_test) > 0:
     elif st.session_state.quiz_complete:
         st.header("Quiz Results")
         
-        # Create a sorted list of models by score
-        sorted_models = sorted(st.session_state.scores.items(), key=lambda x: x[1], reverse=True)
+        # Create aggregate model scores using both scoring systems
+        model_scores = {}
+        model_final_scores = {}
+        
+        # First collect all responses to find min/max values for normalization
+        all_response_times = []
+        all_token_counts = []
+        
+        for q_idx, question in enumerate(st.session_state.accounting_questions):
+            for model in st.session_state.models_to_test:
+                if q_idx in st.session_state.responses and model in st.session_state.responses[q_idx]:
+                    response = st.session_state.responses[q_idx][model]["response"]
+                    if response.startswith("Error:"):
+                        continue
+                    
+                    eval_data = st.session_state.responses[q_idx][model]["evaluation"]
+                    if eval_data:
+                        all_response_times.append(eval_data.get("response_time", 0))
+                        all_token_counts.append(eval_data.get("total_tokens", 0))
+                        
+                        # Initialize counters if needed
+                        if model not in model_scores:
+                            model_scores[model] = 0
+                            model_final_scores[model] = 0
+
+                        # Add to traditional score
+                        model_scores[model] += eval_data.get("total_score", 0)
+        
+        # Determine min/max values for normalization
+        min_response_time = min(all_response_times) if all_response_times else 0
+        max_response_time = max(all_response_times) if all_response_times else 1
+        min_tokens = min(all_token_counts) if all_token_counts else 0
+        max_tokens = max(all_token_counts) if all_token_counts else 1
+        
+        # Ensure no division by zero
+        if min_response_time == max_response_time:
+            max_response_time = min_response_time + 1
+        if min_tokens == max_tokens:
+            max_tokens = min_tokens + 1
+        
+        # Calculate final scores
+        for q_idx, question in enumerate(st.session_state.accounting_questions):
+            for model in st.session_state.models_to_test:
+                if q_idx in st.session_state.responses and model in st.session_state.responses[q_idx]:
+                    response = st.session_state.responses[q_idx][model]["response"]
+                    if response.startswith("Error:"):
+                        continue
+                    
+                    eval_data = st.session_state.responses[q_idx][model]["evaluation"]
+                    if eval_data:
+                        # Normalize metrics according to formula
+                        accuracy_norm = eval_data.get("accuracy", 0) / 10
+                        completeness_norm = eval_data.get("completeness", 0) / 10
+                        clarity_norm = eval_data.get("clarity", 0) / 10
+                        
+                        response_time = eval_data.get("response_time", 0)
+                        response_time_norm = (max_response_time - response_time) / (max_response_time - min_response_time)
+                        
+                        tokens_used = eval_data.get("total_tokens", 0)
+                        token_efficiency_norm = (max_tokens - tokens_used) / (max_tokens - min_tokens)
+                        
+                        # Calculate final weighted score
+                        final_score = (
+                            (0.50 * accuracy_norm) +
+                            (0.20 * completeness_norm) +
+                            (0.15 * clarity_norm) +
+                            (0.10 * response_time_norm) +
+                            (0.05 * token_efficiency_norm)
+                        )
+                        
+                        # Round to 3 decimal places
+                        final_score = round(final_score, 3)
+                        
+                        # Add to model's total final score
+                        model_final_scores[model] += final_score
+                        
+                        # Store final_score in the evaluation data
+                        eval_data["final_score"] = final_score
+                        st.session_state.responses[q_idx][model]["evaluation"] = eval_data
+                        
+                        # Update final_score in the database
+                        try:
+                            conn = sqlite3.connect('db/quiz_results.db')
+                            c = conn.cursor()
+                            c.execute("""
+                                UPDATE responses 
+                                SET final_score = ? 
+                                WHERE quiz_id = ? AND question_id = ? AND model_name = ?
+                            """, (
+                                final_score,
+                                st.session_state.quiz_id,
+                                question_id_for_text(conn, question["question"]),
+                                model
+                            ))
+                            conn.commit()
+                            conn.close()
+                        except Exception as e:
+                            st.error(f"Error updating final_score in database: {e}")
+        
+        # Average the final scores by the number of questions
+        num_questions = len(st.session_state.accounting_questions)
+        for model in model_final_scores:
+            model_final_scores[model] = round(model_final_scores[model] / num_questions, 3)
+        
+        # Let user choose scoring system
+        scoring_system = st.radio(
+            "Choose scoring system:",
+            ["Traditional (Accuracy + Completeness + Clarity)", "Weighted (Including Response Time & Tokens)"],
+            horizontal=True
+        )
+        
+        # Create a sorted list of models by the selected score
+        if scoring_system == "Traditional (Accuracy + Completeness + Clarity)":
+            sorted_models = sorted(model_scores.items(), key=lambda x: x[1], reverse=True)
+            score_description = "Total points (max 30 per question)"
+        else:
+            sorted_models = sorted(model_final_scores.items(), key=lambda x: x[1], reverse=True)
+            score_description = "Weighted score (0-1 scale)"
         
         # Display all scores
         st.markdown("### Final Scores")
+        st.markdown(f"*{score_description}*")
         
         # Create modern card design for scores
         cols = st.columns(min(3, len(sorted_models)))  # Max 3 cards per row
@@ -1027,9 +1279,7 @@ elif len(st.session_state.models_to_test) > 0:
                         with model_tabs[i]:
                             if model in st.session_state.responses[q_idx]:
                                 response = st.session_state.responses[q_idx][model]["response"]
-                                
                                 if response.startswith("Error:"):
-                                    st.error(f"Error: This model encountered an error for this question.")
                                     continue
                                 
                                 st.markdown("### Response:")
@@ -1044,6 +1294,16 @@ elif len(st.session_state.models_to_test) > 0:
                                     col3.metric("Clarity", eval_data.get("clarity", "N/A"))
                                     col4.metric("Total", eval_data.get("total_score", "N/A"))
                                     
+                                    # Add a second row for response time and token count
+                                    col1, col2 = st.columns(2)
+                                    col1.metric("Response Time", f"{eval_data.get('response_time', 0):.2f} sec")
+                                    col2.metric("Total Tokens", eval_data.get("total_tokens", 0))
+                                    
+                                    # Add a third row for token details
+                                    col1, col2 = st.columns(2)
+                                    col1.metric("Prompt Tokens", eval_data.get("prompt_tokens", 0))
+                                    col2.metric("Completion Tokens", eval_data.get("completion_tokens", 0))
+                                    
                                     st.markdown("**Feedback:**")
                                     st.markdown(f"{eval_data.get('feedback', 'No feedback')}")
         
@@ -1052,6 +1312,10 @@ elif len(st.session_state.models_to_test) > 0:
         
         # Prepare data for the summary table
         summary_data = []
+        
+        # First collect all responses to find min/max values for normalization
+        all_response_times = []
+        all_token_counts = []
         
         for q_idx, question in enumerate(st.session_state.accounting_questions):
             for model in st.session_state.models_to_test:
@@ -1062,13 +1326,66 @@ elif len(st.session_state.models_to_test) > 0:
                         
                     eval_data = st.session_state.responses[q_idx][model]["evaluation"]
                     if eval_data:
+                        all_response_times.append(eval_data.get("response_time", 0))
+                        all_token_counts.append(eval_data.get("total_tokens", 0))
+        
+        # Determine min/max values for normalization
+        min_response_time = min(all_response_times) if all_response_times else 0
+        max_response_time = max(all_response_times) if all_response_times else 1
+        min_tokens = min(all_token_counts) if all_token_counts else 0
+        max_tokens = max(all_token_counts) if all_token_counts else 1
+        
+        # Ensure no division by zero
+        if min_response_time == max_response_time:
+            max_response_time = min_response_time + 1
+        if min_tokens == max_tokens:
+            max_tokens = min_tokens + 1
+            
+        # Now create the summary data with normalized scores
+        for q_idx, question in enumerate(st.session_state.accounting_questions):
+            for model in st.session_state.models_to_test:
+                if q_idx in st.session_state.responses and model in st.session_state.responses[q_idx]:
+                    response = st.session_state.responses[q_idx][model]["response"]
+                    if response.startswith("Error:"):
+                        continue
+                        
+                    eval_data = st.session_state.responses[q_idx][model]["evaluation"]
+                    if eval_data:
+                        # Normalize metrics according to formula
+                        accuracy_norm = eval_data.get("accuracy", 0) / 10
+                        completeness_norm = eval_data.get("completeness", 0) / 10
+                        clarity_norm = eval_data.get("clarity", 0) / 10
+                        
+                        response_time = eval_data.get("response_time", 0)
+                        response_time_norm = (max_response_time - response_time) / (max_response_time - min_response_time)
+                        
+                        tokens_used = eval_data.get("total_tokens", 0)
+                        token_efficiency_norm = (max_tokens - tokens_used) / (max_tokens - min_tokens)
+                        
+                        # Calculate final weighted score
+                        final_score = (
+                            (0.50 * accuracy_norm) +
+                            (0.20 * completeness_norm) +
+                            (0.15 * clarity_norm) +
+                            (0.10 * response_time_norm) +
+                            (0.05 * token_efficiency_norm)
+                        )
+                        
+                        # Round to 3 decimal places
+                        final_score = round(final_score, 3)
+                        
                         summary_data.append({
                             'Question': f"{question['difficulty']}: {question['question']}",
                             'Model': model,
                             'Accuracy': eval_data.get("accuracy", 0),
                             'Completeness': eval_data.get("completeness", 0),
                             'Clarity': eval_data.get("clarity", 0),
-                            'Total': eval_data.get("total_score", 0)
+                            'Total': eval_data.get("total_score", 0),
+                            'Response Time (s)': round(eval_data.get("response_time", 0), 2),
+                            'Prompt Tokens': eval_data.get("prompt_tokens", 0),
+                            'Completion Tokens': eval_data.get("completion_tokens", 0),
+                            'Total Tokens': eval_data.get("total_tokens", 0),
+                            'Final Score': final_score
                         })
         
         summary_df = pd.DataFrame(summary_data)
@@ -1093,7 +1410,7 @@ elif len(st.session_state.models_to_test) > 0:
             pivot_df.index = range(len(pivot_df))
         
         # Reset button
-        if st.button("Start New Quiz"):
+        if st.button("Start New Benchmark"):
             st.session_state.scores = {}
             st.session_state.responses = {}
             st.session_state.quiz_complete = False
