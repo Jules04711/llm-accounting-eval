@@ -365,25 +365,11 @@ def save_response(quiz_id, question_text, model_name, response_text, evaluation,
 
 def get_tiktoken_encoding(model_name):
     """
-    Get the appropriate tiktoken encoding based on the model name.
-    Falls back to cl100k_base for most models as a reasonable default.
+    Get the tiktoken encoding for token counting.
+    Using cl100k_base for all models as a standard tokenizer.
     """
-    # Map Ollama model families to OpenAI encoding schemes (approximate mapping)
-    if "llama" in model_name.lower():
-        # Llama models - use cl100k_base as closest approximation
-        return tiktoken.get_encoding("cl100k_base")
-    elif "mistral" in model_name.lower():
-        # Mistral models - use cl100k_base as closest approximation
-        return tiktoken.get_encoding("cl100k_base")
-    elif "gemma" in model_name.lower():
-        # Gemma models - use cl100k_base as closest approximation
-        return tiktoken.get_encoding("cl100k_base")
-    elif "gpt-3.5" in model_name.lower() or "gpt-4" in model_name.lower():
-        # GPT models - use encoding_for_model for most accurate encoding
-        return tiktoken.encoding_for_model(model_name)
-    else:
-        # Default to cl100k_base for unknown models (most recent encoding)
-        return tiktoken.get_encoding("cl100k_base")
+    # Use cl100k_base for all models
+    return tiktoken.get_encoding("cl100k_base")
 
 # Helper function to get question_id from question_text
 def question_id_for_text(conn, question_text):
